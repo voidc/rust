@@ -407,6 +407,10 @@ impl<'tcx> Visitor<'tcx> for IrMaps<'tcx> {
                 intravisit::walk_expr(self, expr);
             }
 
+            hir::ExprKind::Let(ref pat, _) => {
+                self.add_from_pat(pat);
+                intravisit::walk_expr(self, expr);
+            }
             // live nodes required for interesting control flow:
             hir::ExprKind::Match(..) | hir::ExprKind::Loop(..) => {
                 self.add_live_node_for_node(expr.hir_id, ExprNode(expr.span));
@@ -993,6 +997,11 @@ impl<'a, 'tcx> Liveness<'a, 'tcx> {
                 })
             }
 
+            hir::ExprKind::Let(ref pat, ref scrutinee) => {
+                let succ = self.propagate_through_expr(scrutinee, succ);
+                self.define_bindings_in_pat(pat, succ)
+            }
+
             // Note that labels have been resolved, so we don't need to look
             // at the label ident
             hir::ExprKind::Loop(ref blk, _, _) => self.propagate_through_loop(expr, &blk, succ),
@@ -1406,8 +1415,9 @@ impl<'a, 'tcx> Visitor<'tcx> for Liveness<'a, 'tcx> {
         intravisit::walk_local(self, local);
     }
 
-    fn visit_expr(&mut self, ex: &'tcx Expr<'tcx>) {
-        check_expr(self, ex);
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        check_expr(self, expr);
+        intravisit::walk_expr(self, expr);
     }
 
     fn visit_arm(&mut self, arm: &'tcx hir::Arm<'tcx>) {
@@ -1463,6 +1473,10 @@ fn check_expr<'tcx>(this: &mut Liveness<'_, 'tcx>, expr: &'tcx Expr<'tcx>) {
             }
         }
 
+        hir::ExprKind::Let(ref pat, _) => {
+            this.check_unused_vars_in_pat(pat, None, |_, _, _, _| {});
+        }
+
         // no correctness conditions related to liveness
         hir::ExprKind::Call(..)
         | hir::ExprKind::MethodCall(..)
@@ -1492,8 +1506,6 @@ fn check_expr<'tcx>(this: &mut Liveness<'_, 'tcx>, expr: &'tcx Expr<'tcx>) {
         | hir::ExprKind::Type(..)
         | hir::ExprKind::Err => {}
     }
-
-    intravisit::walk_expr(this, expr);
 }
 
 impl<'tcx> Liveness<'_, 'tcx> {

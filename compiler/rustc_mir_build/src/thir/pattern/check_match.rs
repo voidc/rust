@@ -55,9 +55,10 @@ impl<'tcx> Visitor<'tcx> for MatchVisitor<'_, 'tcx> {
 
     fn visit_expr(&mut self, ex: &'tcx hir::Expr<'tcx>) {
         intravisit::walk_expr(self, ex);
-
-        if let hir::ExprKind::Match(ref scrut, ref arms, source) = ex.kind {
-            self.check_match(scrut, arms, source);
+        match &ex.kind {
+            hir::ExprKind::Match(scrut, arms, source) => self.check_match(scrut, arms, *source),
+            hir::ExprKind::Let(pat, scrut) => self.check_let(pat, scrut),
+            _ => {}
         }
     }
 
@@ -72,13 +73,13 @@ impl<'tcx> Visitor<'tcx> for MatchVisitor<'_, 'tcx> {
             hir::LocalSource::AssignDesugar(_) => ("destructuring assignment binding", None),
         };
         self.check_irrefutable(&loc.pat, msg, sp);
-        self.check_patterns(&loc.pat);
+        self.check_pattern(&loc.pat);
     }
 
     fn visit_param(&mut self, param: &'tcx hir::Param<'tcx>) {
         intravisit::walk_param(self, param);
         self.check_irrefutable(&param.pat, "function argument", None);
-        self.check_patterns(&param.pat);
+        self.check_pattern(&param.pat);
     }
 }
 
@@ -120,7 +121,7 @@ impl PatCtxt<'_, '_> {
 }
 
 impl<'tcx> MatchVisitor<'_, 'tcx> {
-    fn check_patterns(&mut self, pat: &Pat<'_>) {
+    fn check_pattern(&mut self, pat: &Pat<'_>) {
         pat.walk_always(|pat| check_borrow_conflicts_in_at_patterns(self, pat));
         if !self.tcx.features().bindings_after_at {
             check_legality_of_bindings_in_at_patterns(self, pat);
@@ -155,6 +156,37 @@ impl<'tcx> MatchVisitor<'_, 'tcx> {
         }
     }
 
+    fn check_let(&mut self, pat: &'tcx hir::Pat<'tcx>, scrut: &hir::Expr<'_>) {
+        self.check_pattern(pat);
+
+        let mut cx = self.new_cx(scrut.hir_id);
+
+        // This does *not* perform exhaustiveness checking, as it is not required for soundness.
+        // Lower the pattern. Note that `lower_pattern` performs some static analysis
+        // which may result in errors. As such, this cannot be removed.
+        let mut have_errors = false;
+        let pattern = self.lower_pattern(&mut cx, pat, &mut have_errors).0;
+        if have_errors {
+            return;
+        }
+
+        let tcx = cx.tcx;
+        let id = pat.hir_id;
+        let mut seen = Matrix::empty();
+        // Lint the branch with the user-specified pattern.
+        let v = PatStack::from_pattern(&pattern);
+        check_useful_lint(&mut cx, &seen, &v, id, false, || {
+            unreachable_pattern(tcx, pat.span, id, None)
+        });
+        seen.push(v);
+        // Lint the logical fallback branch.
+        let wild = cx.pattern_arena.alloc(super::Pat::wildcard_from_ty(pattern.ty));
+        wild.span = pattern.span;
+        check_useful_lint(&mut cx, &seen, &PatStack::from_pattern(wild), id, false, || {
+            irrefutable_let_pattern(tcx, pat.span, id);
+        });
+    }
+
     fn check_match(
         &mut self,
         scrut: &hir::Expr<'_>,
@@ -163,7 +195,7 @@ impl<'tcx> MatchVisitor<'_, 'tcx> {
     ) {
         for arm in arms {
             // Check the arm for some things unrelated to exhaustiveness.
-            self.check_patterns(&arm.pat);
+            self.check_pattern(&arm.pat);
         }
 
         let mut cx = self.new_cx(scrut.hir_id);
@@ -344,62 +376,59 @@ fn unreachable_pattern(tcx: TyCtxt<'_>, span: Span, id: HirId, catchall: Option<
     });
 }
 
-fn irrefutable_let_pattern(tcx: TyCtxt<'_>, span: Span, id: HirId, source: hir::MatchSource) {
+fn irrefutable_let_pattern(tcx: TyCtxt<'_>, span: Span, id: HirId) {
     tcx.struct_span_lint_hir(IRREFUTABLE_LET_PATTERNS, id, span, |lint| {
-        let msg = match source {
-            hir::MatchSource::IfLetDesugar { .. } => "irrefutable if-let pattern",
-            hir::MatchSource::WhileLetDesugar => "irrefutable while-let pattern",
-            _ => bug!(),
-        };
-        lint.build(msg).emit()
+        lint.build("irrefutable `let` pattern").emit()
     });
 }
 
-/// Check for unreachable patterns.
+/// Lint on unreachable patterns and delegate to `handle()` for the useless case.
+fn check_useful_lint<'p, 'tcx>(
+    cx: &mut MatchCheckCtxt<'p, 'tcx>,
+    matrix: &Matrix<'p, 'tcx>,
+    v: &PatStack<'p, 'tcx>,
+    hir_id: HirId,
+    has_guard: bool,
+    handle: impl FnOnce(),
+) {
+    match is_useful(cx, &matrix, &v, LeaveOutWitness, hir_id, has_guard, true) {
+        NotUseful => handle(),
+        Useful(unreachables) => {
+            let mut unreachables: Vec<_> = unreachables.into_iter().flatten().collect();
+            // Emit lints in the order in which they occur in the file.
+            unreachables.sort_unstable();
+            for span in unreachables {
+                unreachable_pattern(cx.tcx, span, hir_id, None);
+            }
+        }
+        UsefulWithWitness(_) => bug!(),
+    }
+}
+
+/// Check for unreachable patterns in `match` and build up the matrix for exhaustiveness checking.
 fn check_arms<'p, 'tcx>(
     cx: &mut MatchCheckCtxt<'p, 'tcx>,
     arms: &[(&'p super::Pat<'tcx>, HirId, bool)],
     source: hir::MatchSource,
 ) -> Matrix<'p, 'tcx> {
+    let tcx = cx.tcx;
     let mut seen = Matrix::empty();
     let mut catchall = None;
-    for (arm_index, (pat, id, has_guard)) in arms.iter().copied().enumerate() {
+    for (pat, id, has_guard) in arms.iter().copied() {
         let v = PatStack::from_pattern(pat);
-        match is_useful(cx, &seen, &v, LeaveOutWitness, id, has_guard, true) {
-            NotUseful => {
-                match source {
-                    hir::MatchSource::IfDesugar { .. } | hir::MatchSource::WhileDesugar => bug!(),
+        check_useful_lint(cx, &seen, &v, id, has_guard, || {
+            match source {
+                hir::MatchSource::IfDesugar { .. } | hir::MatchSource::WhileDesugar => bug!(),
 
-                    hir::MatchSource::IfLetDesugar { .. } | hir::MatchSource::WhileLetDesugar => {
-                        // Check which arm we're on.
-                        match arm_index {
-                            // The arm with the user-specified pattern.
-                            0 => unreachable_pattern(cx.tcx, pat.span, id, None),
-                            // The arm with the wildcard pattern.
-                            1 => irrefutable_let_pattern(cx.tcx, pat.span, id, source),
-                            _ => bug!(),
-                        }
-                    }
-
-                    hir::MatchSource::ForLoopDesugar | hir::MatchSource::Normal => {
-                        unreachable_pattern(cx.tcx, pat.span, id, catchall);
-                    }
-
-                    // Unreachable patterns in try and await expressions occur when one of
-                    // the arms are an uninhabited type. Which is OK.
-                    hir::MatchSource::AwaitDesugar | hir::MatchSource::TryDesugar => {}
+                hir::MatchSource::ForLoopDesugar | hir::MatchSource::Normal => {
+                    unreachable_pattern(tcx, pat.span, id, catchall);
                 }
+
+                // Unreachable patterns in try and await expressions occur when one of
+                // the arms are an uninhabited type. Which is OK.
+                hir::MatchSource::AwaitDesugar | hir::MatchSource::TryDesugar => {}
             }
-            Useful(unreachables) => {
-                let mut unreachables: Vec<_> = unreachables.into_iter().flatten().collect();
-                // Emit lints in the order in which they occur in the file.
-                unreachables.sort_unstable();
-                for span in unreachables {
-                    unreachable_pattern(cx.tcx, span, id, None);
-                }
-            }
-            UsefulWithWitness(_) => bug!(),
-        }
+        });
         if !has_guard {
             seen.push(v);
             if catchall.is_none() && pat_is_catchall(pat) {

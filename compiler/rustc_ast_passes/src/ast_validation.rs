@@ -80,6 +80,9 @@ struct AstValidator<'a> {
     /// certain positions.
     is_assoc_ty_bound_banned: bool,
 
+    /// Used to allow `let` expressions in certain syntactic locations.
+    is_let_allowed: bool,
+
     lint_buffer: &'a mut LintBuffer,
 }
 
@@ -116,6 +119,27 @@ impl<'a> AstValidator<'a> {
         let old = self.bound_context.replace(ctx);
         f(self);
         self.bound_context = old;
+    }
+
+    fn with_let_allowed(&mut self, allowed: bool, f: impl FnOnce(&mut Self, bool)) {
+        let old = mem::replace(&mut self.is_let_allowed, allowed);
+        f(self, old);
+        self.is_let_allowed = old;
+    }
+
+    /// Emits an error banning the `let` expression provided in the given location.
+    fn ban_let_expr(&self, expr: &'a Expr) {
+        let sess = &self.session;
+        if sess.opts.unstable_features.is_nightly_build() {
+            sess.struct_span_err(expr.span, "`let` expressions are not supported here")
+                .note("only supported directly in conditions of `if`- and `while`-expressions")
+                .note("as well as when nested within `&&` and parenthesis in those conditions")
+                .emit();
+        } else {
+            sess.struct_span_err(expr.span, "expected expression, found statement (`let`)")
+                .note("variable declaration using `let` is a statement")
+                .emit();
+        }
     }
 
     fn visit_assoc_ty_constraint_from_generic_args(&mut self, constraint: &'a AssocTyConstraint) {
@@ -795,20 +819,43 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
     }
 
     fn visit_expr(&mut self, expr: &'a Expr) {
-        match &expr.kind {
-            ExprKind::LlvmInlineAsm(..) if !self.session.target.allow_asm => {
-                struct_span_err!(
-                    self.session,
-                    expr.span,
-                    E0472,
-                    "llvm_asm! is unsupported on this target"
-                )
-                .emit();
+        self.with_let_allowed(false, |this, let_allowed| {
+            match &expr.kind {
+                ExprKind::LlvmInlineAsm(..) if !this.session.target.allow_asm => {
+                    struct_span_err!(
+                        this.session,
+                        expr.span,
+                        E0472,
+                        "llvm_asm! is unsupported on this target"
+                    )
+                    .emit();
+                }
+                ExprKind::Let(..) if !let_allowed => this.ban_let_expr(expr),
+                // `(e)` or `e && e` does not impose additional constraints on `e`.
+                ExprKind::Paren(_) | ExprKind::Binary(BinOp { node: BinOpKind::And, .. }, ..) => {
+                    this.with_let_allowed(let_allowed, |this, _| visit::walk_expr(this, expr));
+                    return; // We've already walked into `expr`.
+                }
+                // However, we do allow it in the condition of the `if` expression.
+                // We do not allow `let` in `then` and `opt_else` directly.
+                ExprKind::If(cond, then, opt_else) => {
+                    this.visit_block(then);
+                    walk_list!(this, visit_expr, opt_else);
+                    this.with_let_allowed(true, |this, _| this.visit_expr(cond));
+                    return; // We've already walked into `expr`.
+                }
+                // The same logic applies to `While`.
+                ExprKind::While(cond, then, opt_label) => {
+                    walk_list!(this, visit_label, opt_label);
+                    this.visit_block(then);
+                    this.with_let_allowed(true, |this, _| this.visit_expr(cond));
+                    return; // We've already walked into `expr`.
+                }
+                _ => {}
             }
-            _ => {}
-        }
 
-        visit::walk_expr(self, expr);
+            visit::walk_expr(this, expr);
+        });
     }
 
     fn visit_ty(&mut self, ty: &'a Ty) {
@@ -1443,6 +1490,7 @@ pub fn check_crate(session: &Session, krate: &Crate, lints: &mut LintBuffer) -> 
         bound_context: None,
         is_impl_trait_banned: false,
         is_assoc_ty_bound_banned: false,
+        is_let_allowed: false,
         lint_buffer: lints,
     };
     visit::walk_crate(&mut validator, krate);
