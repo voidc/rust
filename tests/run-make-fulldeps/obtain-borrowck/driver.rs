@@ -103,6 +103,7 @@ impl rustc_driver::Callbacks for CompilerCalls {
             for (def_id, body) in bodies {
                 println!("{}", def_id);
                 assert!(body.input_facts.cfg_edge.len() > 0);
+                assert!(body.output_facts.is_some())
             }
         });
 

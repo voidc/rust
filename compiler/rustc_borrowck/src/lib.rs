@@ -241,7 +241,7 @@ fn do_mir_borrowck<'tcx>(
     let borrow_set =
         Rc::new(BorrowSet::build(tcx, body, locals_are_invalidated_at_exit, &mdpe.move_data));
 
-    let use_polonius = return_body_with_facts || infcx.tcx.sess.opts.unstable_opts.polonius;
+    let use_polonius = infcx.tcx.sess.opts.unstable_opts.polonius;
 
     // Compute non-lexical lifetimes.
     let nll::NllOutput {
@@ -445,7 +445,7 @@ fn do_mir_borrowck<'tcx>(
     };
 
     let body_with_facts = if return_body_with_facts {
-        let output_facts = mbcx.polonius_output.expect("Polonius output was not computed");
+        let output_facts = mbcx.polonius_output;
         Some(Box::new(BodyWithBorrowckFacts {
             body: body_owned,
             input_facts: *polonius_input.expect("Polonius input facts were not generated"),
@@ -472,7 +472,8 @@ pub struct BodyWithBorrowckFacts<'tcx> {
     /// Polonius input facts.
     pub input_facts: AllFacts,
     /// Polonius output facts.
-    pub output_facts: Rc<self::nll::PoloniusOutput>,
+    /// These will only be computed if polonius is enabled.
+    pub output_facts: Option<Rc<self::nll::PoloniusOutput>>,
     /// The table that maps Polonius points to locations in the table.
     pub location_table: LocationTable,
 }
