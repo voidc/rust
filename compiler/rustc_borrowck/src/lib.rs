@@ -287,7 +287,9 @@ fn do_mir_borrowck<'tcx>(
 
     let regioncx = Rc::new(regioncx);
 
-    let flow_borrows = Borrows::new(tcx, body, &regioncx, &borrow_set)
+    let borrows_out_of_scope =
+        dataflow::borrows_out_of_scope_at_location(body, &regioncx, &borrow_set);
+    let flow_borrows = Borrows::new(tcx, body, &borrow_set, &borrows_out_of_scope)
         .into_engine(tcx, body)
         .pass_name("borrowck")
         .iterate_to_fixpoint();
@@ -448,9 +450,12 @@ fn do_mir_borrowck<'tcx>(
         let output_facts = mbcx.polonius_output;
         Some(Box::new(BodyWithBorrowckFacts {
             body: body_owned,
+            promoted,
             input_facts: *polonius_input.expect("Polonius input facts were not generated"),
             output_facts,
             location_table: location_table_owned,
+            borrow_set,
+            borrows_out_of_scope,
         }))
     } else {
         None
@@ -469,6 +474,8 @@ fn do_mir_borrowck<'tcx>(
 pub struct BodyWithBorrowckFacts<'tcx> {
     /// A mir body that contains region identifiers.
     pub body: Body<'tcx>,
+    /// The mir bodies of promoteds.
+    pub promoted: IndexVec<Promoted, Body<'tcx>>,
     /// Polonius input facts.
     pub input_facts: AllFacts,
     /// Polonius output facts.
@@ -476,6 +483,10 @@ pub struct BodyWithBorrowckFacts<'tcx> {
     pub output_facts: Option<Rc<self::nll::PoloniusOutput>>,
     /// The table that maps Polonius points to locations in the table.
     pub location_table: LocationTable,
+    // The set of borrows.
+    pub borrow_set: Rc<BorrowSet<'tcx>>,
+    // A map from locations to borrows ending at that location.
+    pub borrows_out_of_scope: FxIndexMap<Location, Vec<BorrowIndex>>,
 }
 
 pub struct BorrowckInferCtxt<'cx, 'tcx> {

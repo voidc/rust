@@ -9,6 +9,7 @@ use rustc_middle::mir::Body;
 use rustc_middle::ty::TyCtxt;
 
 pub use super::{
+    dataflow::BorrowIndex,
     facts::{AllFacts as PoloniusInput, RustcFacts},
     location::{LocationTable, RichLocation},
     nll::PoloniusOutput,

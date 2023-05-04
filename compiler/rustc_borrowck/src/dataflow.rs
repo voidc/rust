@@ -122,7 +122,7 @@ pub struct Borrows<'a, 'tcx> {
     body: &'a Body<'tcx>,
 
     borrow_set: &'a BorrowSet<'tcx>,
-    borrows_out_of_scope_at_location: FxIndexMap<Location, Vec<BorrowIndex>>,
+    borrows_out_of_scope_at_location: &'a FxIndexMap<Location, Vec<BorrowIndex>>,
 }
 
 struct StackEntry {
@@ -231,27 +231,29 @@ impl<'tcx> OutOfScopePrecomputer<'_, 'tcx> {
     }
 }
 
+pub(crate) fn borrows_out_of_scope_at_location<'a, 'tcx>(
+    body: &'a Body<'tcx>,
+    nonlexical_regioncx: &'a RegionInferenceContext<'tcx>,
+    borrow_set: &'a BorrowSet<'tcx>,
+) -> FxIndexMap<Location, Vec<BorrowIndex>> {
+    let mut prec = OutOfScopePrecomputer::new(body, nonlexical_regioncx);
+    for (borrow_index, borrow_data) in borrow_set.iter_enumerated() {
+        let borrow_region = borrow_data.region;
+        let location = borrow_data.reserve_location;
+
+        prec.precompute_borrows_out_of_scope(borrow_index, borrow_region, location);
+    }
+    prec.borrows_out_of_scope_at_location
+}
+
 impl<'a, 'tcx> Borrows<'a, 'tcx> {
     pub(crate) fn new(
         tcx: TyCtxt<'tcx>,
         body: &'a Body<'tcx>,
-        nonlexical_regioncx: &'a RegionInferenceContext<'tcx>,
         borrow_set: &'a BorrowSet<'tcx>,
+        borrows_out_of_scope_at_location: &'a FxIndexMap<Location, Vec<BorrowIndex>>,
     ) -> Self {
-        let mut prec = OutOfScopePrecomputer::new(body, nonlexical_regioncx);
-        for (borrow_index, borrow_data) in borrow_set.iter_enumerated() {
-            let borrow_region = borrow_data.region;
-            let location = borrow_data.reserve_location;
-
-            prec.precompute_borrows_out_of_scope(borrow_index, borrow_region, location);
-        }
-
-        Borrows {
-            tcx,
-            body,
-            borrow_set,
-            borrows_out_of_scope_at_location: prec.borrows_out_of_scope_at_location,
-        }
+        Borrows { tcx, body, borrow_set, borrows_out_of_scope_at_location }
     }
 
     pub fn location(&self, idx: BorrowIndex) -> &Location {
